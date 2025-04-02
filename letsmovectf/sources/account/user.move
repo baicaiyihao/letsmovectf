@@ -15,6 +15,7 @@ module letsmovectf::user {
     const EAVATAR_NOT_FOUND: u64 = 3;    // Avatar blob_id not found in user's list
     const ECHALLENGE_ALREADY_EXISTS: u64 = 4; // Challenge ID already exists
     const EWRITEUP_ALREADY_EXISTS: u64 = 5;   // WriteUp ID already exists
+    const EUSER_NOT_CHECK: u64 = 6; //user not check
 
 
     // User structure
@@ -40,6 +41,14 @@ module letsmovectf::user {
         users: Table<address, User>,   // Mapping of address to User
     }
 
+
+    // judge is_check_user
+    public(package) fun is_check_user(
+        userlist:&UserList,
+        useraddress:address,
+    ){
+        assert!(table::borrow(&userlist.users,useraddress).github_vaild,EUSER_NOT_CHECK);
+    }
 
     // Event: User registered
     public struct UserRegistered has copy, drop {
