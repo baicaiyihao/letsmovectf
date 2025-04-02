@@ -1,8 +1,11 @@
 module letsmovectf::user {
-    use sui::transfer::{share_object};
+    use sui::transfer::{share_object, public_transfer};
     use sui::table::{Self, Table};
     use std::string::{Self, String};
+    use sui::clock::Clock;
+    use letsmovectf::checkAcount::{UnCheckUserList, addUncheckUser, new_uncheck_list, remove_uncheck_user};
     use sui::event;
+    use sui::nitro_attestation::index;
     use sui::vec_map::{Self, VecMap};
     use letsmovectf::admin::AdminCap;
 
@@ -13,36 +16,30 @@ module letsmovectf::user {
     const ECHALLENGE_ALREADY_EXISTS: u64 = 4; // Challenge ID already exists
     const EWRITEUP_ALREADY_EXISTS: u64 = 5;   // WriteUp ID already exists
 
-    // Coin transaction structure
-    public struct CoinTransaction has copy, drop, store {
-        amount: u64,
-        reason: String,
-        timestamp: u64, // Epoch timestamp
-    }
 
     // User structure
     public struct User has key, store {
         id: UID,
-        email_hash: String,            // Hash of user's email (SHA-256)
-        github_id: String,             // GitHub ID
+        email_hash: Option<String>,            // Hash of user's email (SHA-256)
+        github_id: Option<String>,             // GitHub ID
         avatars: vector<String>,       // List of avatar blob_ids (from Walrus)
         points: u64,                   // Points from solving challenges
-        transaction_counter: u64,      // Counter for transaction IDs
-        coin_acquisitions: Table<u64, CoinTransaction>, // Record of coin acquisitions
-        coin_consumptions: Table<u64, CoinTransaction>, // Record of coin consumptions
         challenges: Table<u64, u64>,   // List of submitted Challenge IDs with timestamps
         solved_challenges: Table<u64, u64>, // List of solved Challenge IDs with timestamps
         writeups: Table<u64, u64>,     // List of submitted WriteUp IDs with timestamps
         abilities: VecMap<String, u64>, // Ability scores (category -> points)
         team: Option<address>,         // Team owner address (if in a team)
         registered_at: u64,            // Registration timestamp (epoch)
+        github_vaild:bool,
     }
+
 
     // Global user list
     public struct UserList has key {
         id: UID,
         users: Table<address, User>,   // Mapping of address to User
     }
+
 
     // Event: User registered
     public struct UserRegistered has copy, drop {
@@ -83,23 +80,6 @@ module letsmovectf::user {
         reason: String,
     }
 
-    // Event: Coins added
-    public struct CoinsAdded has copy, drop {
-        user: address,
-        transaction_id: u64,
-        coins: u64,
-        reason: String,
-        timestamp: u64,
-    }
-
-    // Event: Coins deducted
-    public struct CoinsDeducted has copy, drop {
-        user: address,
-        transaction_id: u64,
-        coins: u64,
-        reason: String,
-        timestamp: u64,
-    }
 
     // Event: User avatar added
     public struct UserAvatarAdded has copy, drop {
@@ -125,38 +105,44 @@ module letsmovectf::user {
         team_owner: address,
     }
 
+
+
     // Initialize the UserList
     fun init(ctx: &mut TxContext) {
         share_object(UserList {
             id: object::new(ctx),
             users: table::new(ctx),
         });
+
+        new_uncheck_list(ctx);
     }
 
     // Register a new user
     public entry fun register_user(
+        email_hash:Option<String>,
+        github_id:Option<String>,
         list: &mut UserList,
+        unchecklist:&mut UnCheckUserList,
+        clock:&Clock,
         ctx: &mut TxContext
     ) {
         let user_addr = tx_context::sender(ctx);
         assert!(!table::contains(&list.users, user_addr), EUSER_ALREADY_EXISTS); // Ensure user doesn't exist
-
         let user = User {
             id: object::new(ctx),
-            email_hash: string::utf8(b""),
-            github_id: string::utf8(b""),
+            email_hash,
+            github_id,
             avatars: vector::empty(),  // Initialize with an empty list
             points: 0,
-            transaction_counter: 0,
-            coin_acquisitions: table::new(ctx),
-            coin_consumptions: table::new(ctx),
             challenges: table::new(ctx),
             solved_challenges: table::new(ctx),
             writeups: table::new(ctx),
             abilities: vec_map::empty(),
+            github_vaild:false,
             team: option::none(),
             registered_at: tx_context::epoch(ctx),
         };
+        addUncheckUser(unchecklist,user_addr,clock);
 
         table::add(&mut list.users, user_addr, user);
         event::emit(UserRegistered {
@@ -167,6 +153,18 @@ module letsmovectf::user {
         });
     }
 
+    // Check user Account
+    public entry fun Check_user_account(
+        _admin:&AdminCap,
+        userlist:&mut UserList,
+        uncheckuserlist:&mut UnCheckUserList,
+        user_address:address,
+    ){
+        assert!(table::contains(&userlist.users,user_address),EUSER_NOT_FOUND);
+        let user=table::borrow_mut(&mut userlist.users,user_address);
+        user.github_vaild=true;
+        remove_uncheck_user(user_address,uncheckuserlist);
+    }
     // Record a challenge solve (callable by other modules)
     public entry fun record_solve(
         user_addr: address,
@@ -202,52 +200,10 @@ module letsmovectf::user {
         });
     }
 
-    // Add a challenge submission (callable by other modules)
-    public entry fun add_challenge(
-        user_addr: address,
-        challenge_id: u64,
-        list: &mut UserList,
-        ctx: &mut TxContext
-    ) {
-        assert!(table::contains(&list.users, user_addr), EUSER_NOT_FOUND); // Ensure user exists
 
-        let user = table::borrow_mut(&mut list.users, user_addr);
-        assert!(!table::contains(&user.challenges, challenge_id), ECHALLENGE_ALREADY_EXISTS); // Ensure Challenge ID is unique
 
-        let timestamp = tx_context::epoch_timestamp_ms(ctx);
-        table::add(&mut user.challenges, challenge_id, timestamp);
-        event::emit(ChallengeSubmitted {
-            user: user_addr,
-            challenge_id,
-            timestamp,
-        });
-    }
-
-    // Add a writeup submission (callable by other modules)
-    public entry fun add_writeup(
-        user_addr: address,
-        writeup_id: u64,
-        challenge_id: u64,
-        list: &mut UserList,
-        ctx: &mut TxContext
-    ) {
-        assert!(table::contains(&list.users, user_addr), EUSER_NOT_FOUND); // Ensure user exists
-
-        let user = table::borrow_mut(&mut list.users, user_addr);
-        assert!(!table::contains(&user.writeups, writeup_id), EWRITEUP_ALREADY_EXISTS); // Ensure WriteUp ID is unique
-
-        let timestamp = tx_context::epoch_timestamp_ms(ctx);
-        table::add(&mut user.writeups, writeup_id, timestamp);
-        event::emit(WriteUpSubmitted {
-            user: user_addr,
-            writeup_id,
-            challenge_id,
-            timestamp,
-        });
-    }
-
-    // Add points to a user (callable by other modules)
     public entry fun add_points(
+        _admin:&AdminCap,
         user_addr: address,
         points: u64,
         reason: String,
@@ -266,65 +222,6 @@ module letsmovectf::user {
         });
     }
 
-    // Add coins to a user (callable by other modules)
-    public entry fun add_coins_transaction(
-        user_addr: address,
-        coins: u64,
-        reason: String,
-        list: &mut UserList,
-        ctx: &mut TxContext
-    ) {
-        assert!(table::contains(&list.users, user_addr), EUSER_NOT_FOUND); // Ensure user exists
-
-        let user = table::borrow_mut(&mut list.users, user_addr);
-        let transaction_id = user.transaction_counter;
-        let timestamp = tx_context::epoch_timestamp_ms(ctx);
-        let transaction = CoinTransaction {
-            amount: coins,
-            reason,
-            timestamp,
-        };
-        table::add(&mut user.coin_acquisitions, transaction_id, transaction);
-        user.transaction_counter = user.transaction_counter + 1;
-
-        event::emit(CoinsAdded {
-            user: user_addr,
-            transaction_id,
-            coins,
-            reason,
-            timestamp,
-        });
-    }
-
-    // Deduct coins from a user (callable by other modules)
-    public entry fun deduct_coins_transaction(
-        user_addr: address,
-        coins: u64,
-        reason: String,
-        list: &mut UserList,
-        ctx: &mut TxContext
-    ) {
-        assert!(table::contains(&list.users, user_addr), EUSER_NOT_FOUND); // Ensure user exists
-
-        let user = table::borrow_mut(&mut list.users, user_addr);
-        let transaction_id = user.transaction_counter;
-        let timestamp = tx_context::epoch_timestamp_ms(ctx);
-        let transaction = CoinTransaction {
-            amount: coins,
-            reason,
-            timestamp,
-        };
-        table::add(&mut user.coin_consumptions, transaction_id, transaction);
-        user.transaction_counter = user.transaction_counter + 1;
-
-        event::emit(CoinsDeducted {
-            user: user_addr,
-            transaction_id,
-            coins,
-            reason,
-            timestamp,
-        });
-    }
 
     // Set user's team (callable by user or team module)
     public(package) fun set_team(
@@ -364,7 +261,7 @@ module letsmovectf::user {
 
     // Save a user email (by user)
     public entry fun save_user_email(
-        email: String,
+        email: Option<String>,
         list: &mut UserList,
         ctx: &mut TxContext
     ) {
@@ -377,7 +274,7 @@ module letsmovectf::user {
 
     // Save a user github_id (by user)
     public entry fun save_user_github_id(
-        github_id: String,
+        github_id: Option<String>,
         list: &mut UserList,
         ctx: &mut TxContext
     ) {
